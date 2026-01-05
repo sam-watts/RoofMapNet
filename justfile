@@ -28,4 +28,6 @@ train-test:
     @PYTHONWARNINGS='ignore::RuntimeWarning' python -m roofmapnet.train.main \
         --data-root rid2_edges/ \
         --image-dir ~/datasets/roof_information_dataset_2/images/ \
+        --resume-from pretrained_models/roofmapnet.pth \
+        --batch-size 1 \
         --max-epochs 1

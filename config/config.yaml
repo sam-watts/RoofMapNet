@@ -4,7 +4,7 @@ io:
   resume_from: 
   num_workers: 8
   tensorboard_port: 0
-  validation_interval: 24000
+  # validation_interval: 24000  # Commented out - validate after every epoch instead
 
 model:
   image:

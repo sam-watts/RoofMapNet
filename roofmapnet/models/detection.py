@@ -135,8 +135,13 @@ class LineVectorizer(nn.Module):
         x = x.reshape(-1, M.n_pts1 * M.dim_loi)
         x = torch.cat([x, f], 1)
         x = self.fc2(x).flatten()
+        line_logits = x
 
-        if input_dict["mode"] != "training":
+        if input_dict["mode"] == "training":
+            result["preds"]["line_logits"] = line_logits
+            result["preds"]["line_labels"] = y
+
+        elif input_dict["mode"] != "training":
             p = torch.cat(ps)
             s = torch.sigmoid(x)
             b = s > 0.1

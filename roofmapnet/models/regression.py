@@ -31,9 +31,20 @@ class MultitaskHead(nn.Module):
 
 
 class MultitaskLearner(nn.Module):
-    def __init__(self, depth, head,num_stacks, num_blocks, num_classes):
+    def __init__(self, depth, head, num_stacks, num_blocks, num_classes):
         super(MultitaskLearner, self).__init__()
-        self.backbone = hg(depth =depth, head=head,num_stacks = num_stacks, num_blocks = num_blocks, num_classes = num_classes)
+        
+        # Create a head function that returns MultitaskHead
+        def create_head(input_channels, output_channels):
+            return MultitaskHead(input_channels, output_channels)
+        
+        self.backbone = hg(
+            depth=depth, 
+            head=create_head,
+            num_stacks=num_stacks, 
+            num_blocks=num_blocks, 
+            num_classes=num_classes
+        )
         head_size = M.head_size
         self.num_class = sum(sum(head_size, []))
         self.head_off = np.cumsum([sum(h) for h in head_size])
@@ -56,32 +67,40 @@ class MultitaskLearner(nn.Module):
         outputs, feature = self.backbone(image)
         result = {"feature": feature}
         batch, channel, row, col = outputs[0].shape
-        T = input_dict["target"].copy()
-        n_jtyp = T["jmap"].shape[1]
-        T_gaussjam = []
-        for i in range(batch):
-            jmap_array = torch.tensor(T["jmap"][i][0],device='cuda')
-            coordinates = torch.argwhere(jmap_array == 1)
-            x = torch.arange(128,device='cuda')
-            y = torch.arange(128,device='cuda')
-            X, Y = torch.meshgrid(x, y)
-            for center_x, center_y in coordinates:
-                distance = torch.sqrt((X - center_x) ** 2 + (Y - center_y) ** 2)
-                jmap_array += torch.exp(self.gaussalpha * (distance / self.gaussbeta) ** 2)
-            jmap_array[jmap_array <= 0.05] = 0
-            jmap_array[jmap_array> 1] = 1
-            new_items =jmap_array.unsqueeze(0).unsqueeze(0)
-            
-            T_gaussjam.append(new_items)
-        T["gaussjmap"] = torch.cat(T_gaussjam, dim=0)
         
-        # switch to CNHW
-        for task in ["jmap"]:
-            T[task] = T[task].permute(1, 0, 2, 3)
-        for task in ["gaussjmap"]:
-            T[task] = T[task].permute(1, 0, 2, 3)
-        for task in ["joff"]:
-            T[task] = T[task].permute(1, 2, 0, 3, 4)
+        # Only process targets during training
+        if "target" in input_dict and input_dict["target"] is not None:
+            T = input_dict["target"].copy()
+            n_jtyp = T["jmap"].shape[1]
+            T_gaussjam = []
+            for i in range(batch):
+                jmap_array = torch.tensor(T["jmap"][i][0], device=image.device)
+                coordinates = torch.argwhere(jmap_array == 1)
+                x = torch.arange(128, device=image.device)
+                y = torch.arange(128, device=image.device)
+                X, Y = torch.meshgrid(x, y, indexing='ij')
+                for center_x, center_y in coordinates:
+                    distance = torch.sqrt((X - center_x) ** 2 + (Y - center_y) ** 2)
+                    jmap_array += torch.exp(self.gaussalpha * (distance / self.gaussbeta) ** 2)
+                jmap_array[jmap_array <= 0.05] = 0
+                jmap_array[jmap_array > 1] = 1
+                new_items = jmap_array.unsqueeze(0).unsqueeze(0)
+                
+                T_gaussjam.append(new_items)
+            T["gaussjmap"] = torch.cat(T_gaussjam, dim=0)
+            
+            # switch to CNHW
+            for task in ["jmap"]:
+                T[task] = T[task].permute(1, 0, 2, 3)
+            for task in ["gaussjmap"]:
+                T[task] = T[task].permute(1, 0, 2, 3)
+            for task in ["joff"]:
+                T[task] = T[task].permute(1, 2, 0, 3, 4)
+            
+            # Store targets in result for loss computation
+            result["targets"] = T
+        else:
+            n_jtyp = 1  # Default for inference
 
         offset = self.head_off
         # loss_weight = M.loss_weight

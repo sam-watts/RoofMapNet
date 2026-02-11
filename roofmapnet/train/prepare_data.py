@@ -23,7 +23,7 @@ from roofmapnet.train.preprocess_rid2 import preprocess_roof_lines
 @click.option(
     '--input-dir',
     type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
-    default='/Users/swatts/datasets/roof_information_dataset_2/preprocessing_output/edge_labels',
+    default='/home/swatts/datasets/roof_information_dataset_2/preprocessing_output/edge_labels',
     help='Directory containing input NPZ files with edge labels'
 )
 @click.option(
@@ -71,6 +71,12 @@ from roofmapnet.train.preprocess_rid2 import preprocess_roof_lines
     is_flag=True,
     help='Skip splitting step (only preprocess data)'
 )
+@click.option(
+    '--gt-image-dir',
+    type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
+    default=None,
+    help='Directory containing ground truth images (PNG files) for visualization'
+)
 def prepare_data(
     input_dir: Path,
     output_dir: Path,
@@ -81,6 +87,7 @@ def prepare_data(
     visualize: bool,
     skip_processing: bool,
     skip_split: bool,
+    gt_image_dir: Path,
 ):
     """Prepare RoofMapNet training data from RID2 edge labels.
     
@@ -122,6 +129,8 @@ def prepare_data(
             for p in files:
                 try:
                     edges = np.load(p)["edges"]
+                    # flip x and y coordinates
+                    edges[:, :, [0, 1]] = edges[:, :, [1, 0]]
                     preprocess_roof_lines(edges, output_dir / p.stem)
                 except Exception as e:
                     click.echo(f"\nWarning: Failed to process {p.name}: {e}", err=True)
@@ -204,6 +213,7 @@ def prepare_data(
         click.echo(f"{'='*60}")
         
         import matplotlib.pyplot as plt
+        from matplotlib.image import imread
         
         # Find a sample file to visualize
         sample_file = None
@@ -220,6 +230,19 @@ def prepare_data(
         
         click.echo(f"Visualizing: {sample_file}")
         
+        # Try to load ground truth image
+        gt_image = None
+        if gt_image_dir is not None:
+            gt_image_path = gt_image_dir / f"{sample_file.stem}.png"
+            if gt_image_path.exists():
+                try:
+                    gt_image = imread(gt_image_path)
+                    click.echo(f"Ground truth image: {gt_image_path}")
+                except Exception as e:
+                    click.echo(f"Warning: Failed to load ground truth image: {e}", err=True)
+            else:
+                click.echo(f"Warning: Ground truth image not found at {gt_image_path}", err=True)
+        
         data = np.load(sample_file)
         
         # Display keys and shapes
@@ -228,17 +251,28 @@ def prepare_data(
             click.echo(f"  {k}: {data[k].shape}")
         
         # Create visualization
-        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
         fig.suptitle(f"Data Visualization: {sample_file.name}", fontsize=14)
         
-        # Junction heatmap
+        # Ground truth image or placeholder
         ax = axes[0, 0]
+        if gt_image is not None:
+            ax.imshow(gt_image)
+            ax.set_title("Ground Truth Image")
+        else:
+            ax.text(0.5, 0.5, "Ground truth image\nnot available\n\nUse --gt-image-dir", 
+                   ha='center', va='center', fontsize=12, transform=ax.transAxes)
+            ax.set_title("Ground Truth Image")
+        ax.axis('off')
+        
+        # Junction heatmap
+        ax = axes[0, 1]
         im = ax.imshow(data["jmap"][0], cmap='hot')
         ax.set_title("Junction Heatmap (jmap)")
         plt.colorbar(im, ax=ax)
         
         # Junction offset (x)
-        ax = axes[0, 1]
+        ax = axes[0, 2]
         im = ax.imshow(data["joff"][0][0], cmap='coolwarm')
         ax.set_title("Junction Offset X (joff[0])")
         plt.colorbar(im, ax=ax)
@@ -254,6 +288,9 @@ def prepare_data(
         im = ax.imshow(data["lmap"], cmap='hot')
         ax.set_title("Line Heatmap (lmap)")
         plt.colorbar(im, ax=ax)
+        
+        # Hide the extra subplot
+        axes[1, 2].axis('off')
         
         plt.tight_layout()
         

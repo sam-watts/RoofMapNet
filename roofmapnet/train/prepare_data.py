@@ -23,7 +23,7 @@ from roofmapnet.train.preprocess_rid2 import preprocess_roof_lines
 @click.option(
     '--input-dir',
     type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
-    default='/home/swatts/datasets/roof_information_dataset_2/preprocessing_output/edge_labels',
+    default='/Users/swatts/datasets/roof_information_dataset_2/preprocessing_output/edge_labels',
     help='Directory containing input NPZ files with edge labels'
 )
 @click.option(

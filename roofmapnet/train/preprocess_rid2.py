@@ -12,12 +12,63 @@ def preprocess_roof_lines(lines, output_filename, image_size=512, heatmap_size=1
         heatmap_size: Size of the output heatmaps
     """
     scale = heatmap_size / image_size
+    bounds_min = 0.0
+    bounds_max = float(image_size - 1)
+
+    def clip_line_to_bounds(p0, p1, minv, maxv):
+        """Clip a line segment to the image bounds using Liang-Barsky.
+
+        Args:
+            p0: (y, x) start point
+            p1: (y, x) end point
+            minv: minimum coordinate value
+            maxv: maximum coordinate value
+
+        Returns:
+            Clipped endpoints [(y0, x0), (y1, x1)] or None if no intersection.
+        """
+        y0, x0 = p0
+        y1, x1 = p1
+        dx = x1 - x0
+        dy = y1 - y0
+        t0, t1 = 0.0, 1.0
+
+        for p, q in [
+            (-dx, x0 - minv),
+            (dx, maxv - x0),
+            (-dy, y0 - minv),
+            (dy, maxv - y0),
+        ]:
+            if p == 0:
+                if q < 0:
+                    return None
+            else:
+                t = q / p
+                if p < 0:
+                    t0 = max(t0, t)
+                else:
+                    t1 = min(t1, t)
+                if t0 > t1:
+                    return None
+
+        cy0 = y0 + t0 * dy
+        cx0 = x0 + t0 * dx
+        cy1 = y0 + t1 * dy
+        cx1 = x0 + t1 * dx
+        return [(cy0, cx0), (cy1, cx1)]
+
+    # Clip lines to image bounds so boundary intersections become endpoints
+    clipped_lines = []
+    for line in lines:
+        clipped = clip_line_to_bounds(line[0], line[1], bounds_min, bounds_max)
+        if clipped is not None:
+            clipped_lines.append(clipped)
     
     # 1. Extract junctions (unique endpoints)
     junctions = []
     junction_map = {}
     
-    for line in lines:
+    for line in clipped_lines:
         for point in line:
             y, x = point
             y_scaled = y * scale
@@ -49,7 +100,7 @@ def preprocess_roof_lines(lines, output_filename, image_size=512, heatmap_size=1
     # 3. Create line heat map
     lmap = np.zeros((heatmap_size, heatmap_size))
     
-    for line in lines:
+    for line in clipped_lines:
         y1, x1 = line[0][0] * scale, line[0][1] * scale
         y2, x2 = line[1][0] * scale, line[1][1] * scale
         
@@ -62,7 +113,7 @@ def preprocess_roof_lines(lines, output_filename, image_size=512, heatmap_size=1
     lpos = []
     Lpos = []
     
-    for line in lines:
+    for line in clipped_lines:
         # Get junction indices for this line's endpoints
         p1 = (round(line[0][0] * scale), round(line[0][1] * scale))
         p2 = (round(line[1][0] * scale), round(line[1][1] * scale))

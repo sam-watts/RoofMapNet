@@ -1,314 +1,432 @@
 """
-Data preparation script for RoofMapNet training.
+Unified data preparation script for RoofMapNet training.
 
-This script processes raw edge labels from RID2 dataset and prepares them
-for training by:
-1. Converting edge labels to RoofMapNet format (NPZ files)
-2. Splitting data into train/valid/test sets
-3. Optionally visualizing the processed data
+Supports multiple source datasets:
+- rid2:       RID2 edge-label NPZ files (requires random train/valid/test split)
+- roofmapnet: RoofMapNet JSON annotations with pre-defined train/valid splits
+
+Each dataset's source splits are respected.  Processed NPZ files are written
+into a shared output directory under <dataset>/train/, <dataset>/valid/, etc.
 """
 
 from pathlib import Path
+import json
 import random
 import shutil
+from typing import List, Optional
 
 import click
+import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.image import imread
 from tqdm import tqdm
 
 from roofmapnet.train.preprocess_rid2 import preprocess_roof_lines
 
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+VALID_DATASETS = ("rid2", "roofmapnet")
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _load_json(path: Path):
+    with open(path, "r") as f:
+        return json.load(f)
+
+
+def _convert_lines(lines_raw):
+    """Convert flat [y1, x1, y2, x2] lists into endpoint pairs."""
+    lines = []
+    for line in lines_raw:
+        if len(line) != 4:
+            raise ValueError(f"Expected 4 values per line, got {len(line)}")
+        y1, x1, y2, x2 = line
+        lines.append([(y1, x1), (y2, x2)])
+    return lines
+
+
+# ---------------------------------------------------------------------------
+# Per-dataset processing
+# ---------------------------------------------------------------------------
+
+
+def process_rid2(
+    label_dir: Path,
+    image_dir: Optional[Path],
+    output_dir: Path,
+    train_split: float,
+    valid_split: float,
+    seed: int,
+    skip_existing: bool,
+):
+    """Process RID2 edge-label NPZs.  Source has no splits so we create them."""
+    click.echo(f"\n  Label dir: {label_dir}")
+    if image_dir:
+        click.echo(f"  Image dir: {image_dir}")
+
+    input_files = sorted(label_dir.glob("*.npz"))
+    if not input_files:
+        raise click.ClickException(f"No NPZ files found in {label_dir}")
+    click.echo(f"  Found {len(input_files)} label files")
+
+    # -- preprocess each file into a flat staging area, then split ----------
+    staging = output_dir / "_rid2_staging"
+    staging.mkdir(parents=True, exist_ok=True)
+
+    for p in tqdm(input_files, desc="  rid2 preprocess"):
+        out_path = staging / f"{p.stem}.npz"
+        if skip_existing and out_path.exists():
+            continue
+        try:
+            edges = np.load(p)["edges"]
+            edges[:, :, [0, 1]] = edges[:, :, [1, 0]]  # flip x/y
+            preprocess_roof_lines(edges, out_path)
+        except Exception as e:
+            click.echo(f"\n  Warning: {p.name}: {e}", err=True)
+
+    # -- random split -------------------------------------------------------
+    all_staged = sorted(staging.glob("*.npz"))
+    random.seed(seed)
+    random.shuffle(all_staged)
+
+    n = len(all_staged)
+    n_train = int(train_split * n)
+    n_valid = int(valid_split * n)
+
+    splits = {
+        "train": all_staged[:n_train],
+        "valid": all_staged[n_train : n_train + n_valid],
+        "test": all_staged[n_train + n_valid :],
+    }
+
+    for split_name, files in splits.items():
+        dest = output_dir / split_name
+        dest.mkdir(parents=True, exist_ok=True)
+        for f in files:
+            shutil.move(str(f), str(dest / f.name))
+
+    shutil.rmtree(staging, ignore_errors=True)
+
+    for s in ("train", "valid", "test"):
+        count = len(list((output_dir / s).glob("*.npz")))
+        click.echo(f"  {s}: {count} files")
+
+
+def process_roofmapnet(
+    label_dir: Path,
+    image_dir: Optional[Path],
+    output_dir: Path,
+    skip_existing: bool,
+):
+    """Process RoofMapNet JSON annotations.  Source already has train/valid."""
+    click.echo(f"\n  Label dir: {label_dir}")
+    if image_dir:
+        click.echo(f"  Image dir: {image_dir}")
+
+    train_json = label_dir / "train.json"
+    valid_json = label_dir / "valid.json"
+
+    if not train_json.exists() or not valid_json.exists():
+        raise click.ClickException(
+            f"Expected train.json and valid.json in {label_dir}"
+        )
+
+    split_map = {"train": train_json, "valid": valid_json}
+
+    for split_name, json_path in split_map.items():
+        dest = output_dir / split_name
+        dest.mkdir(parents=True, exist_ok=True)
+
+        annotations = _load_json(json_path)
+        click.echo(f"  {split_name}: {len(annotations)} samples")
+
+        for sample in tqdm(annotations, desc=f"  roofmapnet {split_name}"):
+            filename = Path(sample["filename"]).stem
+            out_path = dest / f"{filename}.npz"
+            if skip_existing and out_path.exists():
+                continue
+
+            lines = _convert_lines(sample.get("lines", []))
+            preprocess_roof_lines(lines, out_path)
+
+    for s in ("train", "valid"):
+        count = len(list((output_dir / s).glob("*.npz")))
+        click.echo(f"  {s}: {count} files")
+
+
+# ---------------------------------------------------------------------------
+# Visualization
+# ---------------------------------------------------------------------------
+
+
+def visualize_dataset(
+    dataset_name: str,
+    output_dir: Path,
+    image_dir: Optional[Path],
+    n_samples: int = 5,
+):
+    """Generate *n_samples* visualizations for a processed dataset."""
+    click.echo(f"\n  Generating {n_samples} visualizations for {dataset_name}")
+
+    # Collect sample files from all splits
+    samples: list[Path] = []
+    for split in ("train", "valid", "test"):
+        split_dir = output_dir / split
+        if split_dir.exists():
+            samples.extend(sorted(split_dir.glob("*.npz")))
+    if not samples:
+        click.echo(f"  No processed files found for {dataset_name}", err=True)
+        return
+
+    # Pick up to n_samples evenly spaced across the dataset
+    step = max(1, len(samples) // n_samples)
+    chosen = samples[::step][:n_samples]
+
+    viz_dir = output_dir / "visualizations"
+    viz_dir.mkdir(parents=True, exist_ok=True)
+
+    for sample_file in chosen:
+        data = np.load(sample_file)
+
+        # Attempt to load the source image
+        gt_image = None
+        if image_dir is not None:
+            for ext in (".png", ".jpg", ".jpeg", ".tif"):
+                candidate = image_dir / f"{sample_file.stem}{ext}"
+                if candidate.exists():
+                    try:
+                        gt_image = imread(str(candidate))
+                    except Exception:
+                        pass
+                    break
+
+        n_cols = 3
+        n_rows = 2
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(15, 10))
+        fig.suptitle(f"{dataset_name}: {sample_file.stem}", fontsize=14)
+
+        # 1 – Source image
+        ax = axes[0, 0]
+        if gt_image is not None:
+            ax.imshow(gt_image)
+            ax.set_title("Source Image")
+        else:
+            ax.text(
+                0.5,
+                0.5,
+                "Source image\nnot available",
+                ha="center",
+                va="center",
+                fontsize=12,
+                transform=ax.transAxes,
+            )
+            ax.set_title("Source Image")
+        ax.axis("off")
+
+        # 2 – Junction heatmap
+        ax = axes[0, 1]
+        im = ax.imshow(data["jmap"][0], cmap="hot")
+        ax.set_title("Junction Heatmap (jmap)")
+        plt.colorbar(im, ax=ax)
+
+        # 3 – Junction offset X
+        ax = axes[0, 2]
+        im = ax.imshow(data["joff"][0][0], cmap="coolwarm")
+        ax.set_title("Junction Offset X")
+        plt.colorbar(im, ax=ax)
+
+        # 4 – Junction offset Y
+        ax = axes[1, 0]
+        im = ax.imshow(data["joff"][0][1], cmap="coolwarm")
+        ax.set_title("Junction Offset Y")
+        plt.colorbar(im, ax=ax)
+
+        # 5 – Line heatmap
+        ax = axes[1, 1]
+        im = ax.imshow(data["lmap"], cmap="hot")
+        ax.set_title("Line Heatmap (lmap)")
+        plt.colorbar(im, ax=ax)
+
+        # 6 – Stats text
+        ax = axes[1, 2]
+        stats = (
+            f"junctions: {data['junc'].shape[0]}\n"
+            f"pos lines: {data['Lpos'].shape[0]}\n"
+            f"neg lines: {data['Lneg'].shape[0]}\n"
+            f"jmap range: [{data['jmap'].min():.2f}, {data['jmap'].max():.2f}]\n"
+            f"lmap range: [{data['lmap'].min():.2f}, {data['lmap'].max():.2f}]"
+        )
+        ax.text(0.1, 0.5, stats, fontsize=12, va="center", family="monospace")
+        ax.set_title("Stats")
+        ax.axis("off")
+
+        plt.tight_layout()
+        viz_path = viz_dir / f"viz_{dataset_name}_{sample_file.stem}.png"
+        plt.savefig(viz_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+
+    click.echo(f"  ✓ Saved {len(chosen)} images to {viz_dir}")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
 
 @click.command()
 @click.option(
-    '--input-dir',
-    type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
-    default='/Users/swatts/datasets/roof_information_dataset_2/preprocessing_output/edge_labels',
-    help='Directory containing input NPZ files with edge labels'
+    "--datasets",
+    type=click.Choice(VALID_DATASETS, case_sensitive=False),
+    multiple=True,
+    required=True,
+    help="Which datasets to include (can be specified multiple times)",
 )
 @click.option(
-    '--output-dir',
+    "--output-dir",
     type=click.Path(file_okay=False, dir_okay=True, path_type=Path),
-    default='rid2_edges',
-    help='Output directory for processed data'
+    default="processed",
+    help="Root output directory for all processed data",
+)
+# -- RID2 paths --
+@click.option(
+    "--rid2-label-dir",
+    type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
+    default="/Users/swatts/datasets/roof_information_dataset_2/preprocessing_output/edge_labels",
+    help="RID2: directory containing edge-label NPZ files",
 )
 @click.option(
-    '--train-split',
-    type=float,
-    default=0.7,
-    help='Fraction of data to use for training (default: 0.7)'
-)
-@click.option(
-    '--valid-split',
-    type=float,
-    default=0.15,
-    help='Fraction of data to use for validation (default: 0.15)'
-)
-@click.option(
-    '--test-split',
-    type=float,
-    default=0.15,
-    help='Fraction of data to use for testing (default: 0.15)'
-)
-@click.option(
-    '--seed',
-    type=int,
-    default=42,
-    help='Random seed for reproducible splits (default: 42)'
-)
-@click.option(
-    '--visualize',
-    is_flag=True,
-    help='Generate visualizations of processed data'
-)
-@click.option(
-    '--skip-processing',
-    is_flag=True,
-    help='Skip preprocessing step (only split existing data)'
-)
-@click.option(
-    '--skip-split',
-    is_flag=True,
-    help='Skip splitting step (only preprocess data)'
-)
-@click.option(
-    '--gt-image-dir',
+    "--rid2-image-dir",
     type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
     default=None,
-    help='Directory containing ground truth images (PNG files) for visualization'
+    help="RID2: directory containing source images (for visualization)",
 )
+# -- RoofMapNet paths --
+@click.option(
+    "--roofmapnet-label-dir",
+    type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
+    default="data",
+    help="RoofMapNet: directory containing train.json / valid.json",
+)
+@click.option(
+    "--roofmapnet-image-dir",
+    type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
+    default="data/images",
+    help="RoofMapNet: directory containing source images (for visualization)",
+)
+# -- Split config (RID2 only – RoofMapNet splits come from JSON) --
+@click.option("--train-split", type=float, default=0.7, help="RID2 train fraction")
+@click.option("--valid-split", type=float, default=0.15, help="RID2 valid fraction")
+@click.option("--test-split", type=float, default=0.15, help="RID2 test fraction")
+@click.option("--seed", type=int, default=42, help="Random seed for RID2 split")
+# -- Flags --
+@click.option(
+    "--visualize", is_flag=True, help="Generate 5 visualizations per dataset"
+)
+@click.option("--skip-existing", is_flag=True, help="Skip files that already exist")
 def prepare_data(
-    input_dir: Path,
+    datasets: List[str],
     output_dir: Path,
+    rid2_label_dir: Path,
+    rid2_image_dir: Optional[Path],
+    roofmapnet_label_dir: Path,
+    roofmapnet_image_dir: Optional[Path],
     train_split: float,
     valid_split: float,
     test_split: float,
     seed: int,
     visualize: bool,
-    skip_processing: bool,
-    skip_split: bool,
-    gt_image_dir: Path,
+    skip_existing: bool,
 ):
-    """Prepare RoofMapNet training data from RID2 edge labels.
-    
-    This script will:
-    1. Convert edge labels to RoofMapNet format (unless --skip-processing)
-    2. Split data into train/valid/test sets (unless --skip-split)
-    3. Optionally visualize the data (if --visualize)
+    """Prepare training data from one or more source datasets.
+
+    Source splits are respected: RoofMapNet uses train.json / valid.json;
+    RID2 is randomly split using --train-split / --valid-split / --test-split.
+
+    \b
+    Examples
+    --------
+        python -m roofmapnet.train.prepare_data --datasets rid2
+        python -m roofmapnet.train.prepare_data --datasets rid2 --datasets roofmapnet --visualize
     """
-    
-    # Validate splits sum to 1.0
-    total_split = train_split + valid_split + test_split
-    if not (0.99 <= total_split <= 1.01):
-        raise click.BadParameter(
-            f"Splits must sum to 1.0 (got {total_split}). "
-            f"Adjust --train-split, --valid-split, and --test-split."
-        )
-    
-    output_dir.mkdir(exist_ok=True, parents=True)
-    
-    # ===== Step 1: Preprocess edge labels =====
-    if not skip_processing:
-        click.echo(f"\n{'='*60}")
-        click.echo("Step 1: Preprocessing edge labels")
-        click.echo(f"{'='*60}")
-        click.echo(f"Input directory:  {input_dir}")
-        click.echo(f"Output directory: {output_dir}")
-        
-        input_files = list(input_dir.glob("*.npz"))
-        if not input_files:
-            raise click.ClickException(f"No NPZ files found in {input_dir}")
-        
-        click.echo(f"Found {len(input_files)} files to process")
-        
-        with click.progressbar(
-            input_files,
-            label='Processing files',
-            show_pos=True
-        ) as files:
-            for p in files:
-                try:
-                    edges = np.load(p)["edges"]
-                    # flip x and y coordinates
-                    edges[:, :, [0, 1]] = edges[:, :, [1, 0]]
-                    preprocess_roof_lines(edges, output_dir / p.stem)
-                except Exception as e:
-                    click.echo(f"\nWarning: Failed to process {p.name}: {e}", err=True)
-        
-        click.echo(f"✓ Preprocessing complete!")
-    else:
-        click.echo("Skipping preprocessing step (--skip-processing)")
-    
-    # ===== Step 2: Split into train/valid/test =====
-    if not skip_split:
-        click.echo(f"\n{'='*60}")
-        click.echo("Step 2: Splitting data into train/valid/test")
-        click.echo(f"{'='*60}")
-        
-        # Get all npz files in output_dir (not in subdirectories)
-        all_files = sorted([f for f in output_dir.glob("*.npz") if f.is_file()])
-        
-        if not all_files:
-            raise click.ClickException(
-                f"No NPZ files found in {output_dir}. "
-                f"Run without --skip-processing first."
+    datasets_lower = [d.lower() for d in datasets]
+    output_dir = output_dir.resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    click.echo(f"{'=' * 60}")
+    click.echo(f"Preparing datasets: {', '.join(datasets_lower)}")
+    click.echo(f"Output directory:   {output_dir}")
+    click.echo(f"{'=' * 60}")
+
+    # ── RID2 ──────────────────────────────────────────────────────────────
+    if "rid2" in datasets_lower:
+        total = train_split + valid_split + test_split
+        if not (0.99 <= total <= 1.01):
+            raise click.BadParameter(
+                f"RID2 splits must sum to 1.0 (got {total})"
             )
-        
-        click.echo(f"Total files: {len(all_files)}")
-        click.echo(f"Split ratios: Train={train_split:.1%}, Valid={valid_split:.1%}, Test={test_split:.1%}")
-        click.echo(f"Random seed: {seed}")
-        
-        # Shuffle with fixed seed for reproducibility
-        random.seed(seed)
-        random.shuffle(all_files)
-        
-        # Calculate split sizes
-        n_total = len(all_files)
-        n_train = int(train_split * n_total)
-        n_valid = int(valid_split * n_total)
-        
-        train_files = all_files[:n_train]
-        valid_files = all_files[n_train:n_train + n_valid]
-        test_files = all_files[n_train + n_valid:]
-        
-        click.echo(f"Split sizes: Train={len(train_files)}, Valid={len(valid_files)}, Test={len(test_files)}")
-        
-        # Create subdirectories
-        train_dir = output_dir / "train"
-        valid_dir = output_dir / "valid"
-        test_dir = output_dir / "test"
-        
-        train_dir.mkdir(exist_ok=True)
-        valid_dir.mkdir(exist_ok=True)
-        test_dir.mkdir(exist_ok=True)
-        
-        # Move files to respective directories
-        def move_files(files, target_dir, split_name):
-            with click.progressbar(
-                files,
-                label=f'Moving to {split_name}',
-                show_pos=True
-            ) as file_list:
-                for f in file_list:
-                    try:
-                        shutil.move(str(f), str(target_dir / f.name))
-                    except Exception as e:
-                        click.echo(f"\nWarning: Failed to move {f.name}: {e}", err=True)
-        
-        move_files(train_files, train_dir, "train")
-        move_files(valid_files, valid_dir, "valid")
-        move_files(test_files, test_dir, "test")
-        
-        click.echo(f"\n✓ Data split complete!")
-        click.echo(f"  Train: {len(list(train_dir.glob('*.npz')))} files in {train_dir}")
-        click.echo(f"  Valid: {len(list(valid_dir.glob('*.npz')))} files in {valid_dir}")
-        click.echo(f"  Test:  {len(list(test_dir.glob('*.npz')))} files in {test_dir}")
-    else:
-        click.echo("Skipping split step (--skip-split)")
-    
-    # ===== Step 3: Visualize (optional) =====
-    if visualize:
-        click.echo(f"\n{'='*60}")
-        click.echo("Step 3: Generating visualizations")
-        click.echo(f"{'='*60}")
-        
-        import matplotlib.pyplot as plt
-        from matplotlib.image import imread
-        
-        # Find a sample file to visualize
-        sample_file = None
-        for subdir in ['train', 'valid', 'test', '.']:
-            search_dir = output_dir / subdir if subdir != '.' else output_dir
-            npz_files = list(search_dir.glob("*.npz"))
-            if npz_files:
-                sample_file = npz_files[0]
-                break
-        
-        if sample_file is None:
-            click.echo("No NPZ files found to visualize", err=True)
-            return
-        
-        click.echo(f"Visualizing: {sample_file}")
-        
-        # Try to load ground truth image
-        gt_image = None
-        if gt_image_dir is not None:
-            gt_image_path = gt_image_dir / f"{sample_file.stem}.png"
-            if gt_image_path.exists():
-                try:
-                    gt_image = imread(gt_image_path)
-                    click.echo(f"Ground truth image: {gt_image_path}")
-                except Exception as e:
-                    click.echo(f"Warning: Failed to load ground truth image: {e}", err=True)
-            else:
-                click.echo(f"Warning: Ground truth image not found at {gt_image_path}", err=True)
-        
-        data = np.load(sample_file)
-        
-        # Display keys and shapes
-        click.echo("\nData structure:")
-        for k in data.keys():
-            click.echo(f"  {k}: {data[k].shape}")
-        
-        # Create visualization
-        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-        fig.suptitle(f"Data Visualization: {sample_file.name}", fontsize=14)
-        
-        # Ground truth image or placeholder
-        ax = axes[0, 0]
-        if gt_image is not None:
-            ax.imshow(gt_image)
-            ax.set_title("Ground Truth Image")
-        else:
-            ax.text(0.5, 0.5, "Ground truth image\nnot available\n\nUse --gt-image-dir", 
-                   ha='center', va='center', fontsize=12, transform=ax.transAxes)
-            ax.set_title("Ground Truth Image")
-        ax.axis('off')
-        
-        # Junction heatmap
-        ax = axes[0, 1]
-        im = ax.imshow(data["jmap"][0], cmap='hot')
-        ax.set_title("Junction Heatmap (jmap)")
-        plt.colorbar(im, ax=ax)
-        
-        # Junction offset (x)
-        ax = axes[0, 2]
-        im = ax.imshow(data["joff"][0][0], cmap='coolwarm')
-        ax.set_title("Junction Offset X (joff[0])")
-        plt.colorbar(im, ax=ax)
-        
-        # Junction offset (y)
-        ax = axes[1, 0]
-        im = ax.imshow(data["joff"][0][1], cmap='coolwarm')
-        ax.set_title("Junction Offset Y (joff[1])")
-        plt.colorbar(im, ax=ax)
-        
-        # Line heatmap
-        ax = axes[1, 1]
-        im = ax.imshow(data["lmap"], cmap='hot')
-        ax.set_title("Line Heatmap (lmap)")
-        plt.colorbar(im, ax=ax)
-        
-        # Hide the extra subplot
-        axes[1, 2].axis('off')
-        
-        plt.tight_layout()
-        
-        # Save visualization
-        viz_path = output_dir / f"visualization_{sample_file.stem}.png"
-        plt.savefig(viz_path, dpi=150, bbox_inches='tight')
-        click.echo(f"✓ Visualization saved to: {viz_path}")
-        
-        # Show interactively if possible
-        try:
-            plt.show()
-        except Exception:
-            pass  # Headless environment
-    
-    click.echo(f"\n{'='*60}")
-    click.echo("✓ All steps complete!")
-    click.echo(f"{'='*60}")
+
+        click.echo(f"\n{'─' * 60}")
+        click.echo("Dataset: rid2")
+        click.echo(f"{'─' * 60}")
+
+        rid2_out = output_dir / "rid2"
+        rid2_out.mkdir(parents=True, exist_ok=True)
+
+        process_rid2(
+            label_dir=rid2_label_dir,
+            image_dir=rid2_image_dir,
+            output_dir=rid2_out,
+            train_split=train_split,
+            valid_split=valid_split,
+            seed=seed,
+            skip_existing=skip_existing,
+        )
+
+        if visualize:
+            visualize_dataset("rid2", rid2_out, rid2_image_dir, n_samples=5)
+
+    # ── RoofMapNet ────────────────────────────────────────────────────────
+    if "roofmapnet" in datasets_lower:
+        click.echo(f"\n{'─' * 60}")
+        click.echo("Dataset: roofmapnet")
+        click.echo(f"{'─' * 60}")
+
+        rmn_out = output_dir / "roofmapnet"
+        rmn_out.mkdir(parents=True, exist_ok=True)
+
+        process_roofmapnet(
+            label_dir=roofmapnet_label_dir,
+            image_dir=roofmapnet_image_dir,
+            output_dir=rmn_out,
+            skip_existing=skip_existing,
+        )
+
+        if visualize:
+            visualize_dataset(
+                "roofmapnet", rmn_out, roofmapnet_image_dir, n_samples=5
+            )
+
+    # ── Summary ───────────────────────────────────────────────────────────
+    click.echo(f"\n{'=' * 60}")
+    click.echo("Summary")
+    click.echo(f"{'=' * 60}")
+
+    for ds in datasets_lower:
+        ds_dir = output_dir / ds
+        for split in ("train", "valid", "test"):
+            split_dir = ds_dir / split
+            if split_dir.exists():
+                n = len(list(split_dir.glob("*.npz")))
+                click.echo(f"  {ds}/{split}: {n} files")
+
+    click.echo("\n✓ All done!")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     prepare_data()
